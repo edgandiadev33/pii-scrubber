@@ -118,7 +118,7 @@
     <div class="divider"></div>
 
     <h2>Custom terms (one per line)</h2>
-    <textarea id="custom" style="min-height:120px" placeholder="Names, project codenames, account IDs…&#10;e.g.&#10;Alice Johnson&#10;Project Falcon&#10;ACME-98213"></textarea>
+    <textarea id="custom" spellcheck="false" style="min-height:120px" placeholder="Names, project codenames, account IDs…&#10;e.g.&#10;Alice Johnson&#10;Project Falcon&#10;ACME-98213"></textarea>
     <div class="sub">Matched case-insensitively as whole words.</div>
 
     <div class="divider"></div>
@@ -183,6 +183,18 @@
       re: /\b\d{1,6}\s+(?:[NSEW]\.?\s+)?[A-Z][A-Za-z0-9.'\-]*(?:\s+[A-Z][A-Za-z0-9.'\-]*){0,4}\s+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Circle|Cir|Place|Pl|Way|Terrace|Ter|Parkway|Pkwy|Highway|Hwy|Route|Rte|Trail|Trl|Square|Sq|Loop)\b\.?/g,
     },
     {
+      id: "person", label: "Person names", on: true, dynamic: true,
+      title: "Speaker labels, titled names and known given names \u2014 then every later mention of that person.",
+    },
+    {
+      id: "org", label: "Company / org names", on: true, dynamic: true,
+      title: "Names carrying a corporate suffix (Inc, LLC, Ltd, Group, Partners\u2026), plus later bare mentions.",
+    },
+    {
+      id: "person_aggressive", label: "Aggressive name guessing", on: false, dynamic: true,
+      title: "Redacts ANY capitalised multi-word phrase. Catches unusual names; also catches place names and headings.",
+    },
+    {
       id: "zip", label: "US ZIP codes", on: false,
       re: /\b\d{5}(?:-\d{4})?\b/g,
     },
@@ -230,6 +242,197 @@
     return sum % 10 === 0;
   }
 
+  // ---------- Name & organisation detection ----------
+  // A name has no fixed shape: "Sarah Chen" is indistinguishable from "Last Tuesday" to a
+  // regex. So rather than matching names directly, we find each one ONCE via a
+  // high-confidence anchor -- a transcript speaker label, an honorific, a known given name,
+  // or a corporate suffix -- and then propagate that hit to every other mention in the
+  // document, including later bare first-name or surname references.
+  // This raises recall a lot, but it is heuristic: review the output and use Custom terms
+  // for anything it misses.
+
+  const WORDCH = "A-Za-z0-9\\u00C0-\\u024F";
+  const NPART  = "[A-Z\\u00C0-\\u00DE][A-Za-z\\u00C0-\\u024F'\\u2019.\\-]*";
+
+  const FIRST_NAMES = new Set((
+    "james robert john michael david william richard joseph thomas charles christopher daniel matthew anthony mark donald steven paul andrew joshua kenneth kevin brian george timothy ronald edward jason jeffrey ryan jacob gary nicholas eric jonathan stephen larry justin scott brandon benjamin samuel gregory alexander patrick frank raymond jack dennis jerry tyler aaron adam nathan henry zachary douglas peter kyle noah ethan jeremy walter christian keith roger terry austin sean gerald carl harold dylan arthur lawrence jordan jesse bryan bruce gabriel joe logan alan albert willie elijah wayne randy vincent mason roy ralph bobby russell bradley philip eugene ernest stanley craig alfred clarence marcus leonard nathaniel curtis calvin francis todd travis shane cody caleb evan lucas isaac owen ian chad derek phillip corey trevor seth colin wesley glenn jared tony luke marcos " +
+    "mary patricia jennifer linda elizabeth barbara susan jessica sarah karen lisa nancy betty margaret sandra ashley kimberly emily donna michelle carol amanda dorothy melissa deborah stephanie rebecca sharon laura cynthia amy kathleen angela shirley anna brenda pamela emma nicole helen samantha katherine christine debra rachel carolyn janet catherine heather diane ruth julie olivia joyce virginia victoria kelly lauren christina joan evelyn judith megan andrea cheryl hannah jacqueline martha gloria teresa ann sara madison frances kathryn janice jean abigail alice julia judy sophia denise amber doris marilyn danielle beverly isabella theresa diana natalie brittany charlotte marie kayla alexis lori tracy stacy erin colleen maureen kara leah naomi vanessa monica tina wendy rhonda nina sheila ellen bonnie anne kristen holly michele lindsay claire molly jenna alyssa " +
+    "mohammed muhammad ahmed ali omar hassan ibrahim yousef youssef khalid tariq mustafa rashid karim samir nadia fatima aisha layla zainab yasmin amira hana rania " +
+    "wei li ming chen jing yan hui feng ping lei jun xin yu hong xiao mei ling qiang tao bin yong hua " +
+    "raj priya amit anil sunil ravi vijay arun deepak rahul sanjay ajay rohit vikram neha pooja anita kavita meera asha sunita rekha divya shreya suresh ramesh mahesh " +
+    "carlos luis miguel jorge javier pedro pablo diego alejandro fernando ricardo eduardo rafael andres sergio manuel antonio francisco roberto ramon hector oscar ruben " +
+    "ana sofia camila valentina lucia elena rosa carmen isabel gabriela daniela paula adriana beatriz pilar " +
+    "hiroshi takeshi kenji yuki akira satoshi haruto sakura yui aoi ren sota " +
+    "ivan dmitri sergei mikhail vladimir andrei alexei nikolai natasha olga svetlana irina " +
+    "kwame kofi ama abena chidi ngozi emeka amara thabo sipho tunde folake " +
+    "lars erik nils bjorn anders magnus henrik ingrid astrid freya sigrid " +
+    "pierre jacques henri louis philippe laurent claire sylvie brigitte celine " +
+    "hans klaus jurgen wolfgang dieter ursula heidi greta " +
+    "seamus liam siobhan niamh aoife declan ciara ronan padraig " +
+    "giuseppe giovanni marco luca matteo francesca giulia chiara alessia"
+  ).split(/\s+/));
+
+  // Words that look like names in context but are not. Used to reject candidates whose
+  // FIRST token is one of these (catches "Action Items:", "Next Steps:", "Note:").
+  const NON_NAME_WORDS = new Set((
+    "note notes action actions item items summary agenda attendee attendees present topic topics " +
+    "subject date time location duration participant participants speaker speakers host hosts guest " +
+    "guests interviewer interviewee moderator update updates next step steps background overview " +
+    "conclusion decision decisions risk risks issue issues question questions answer answers todo " +
+    "fixme chapter section part page line file folder project client customer company team department " +
+    "office transcript recording meeting call session webinar podcast episode introduction intro outro " +
+    "closing opening welcome thanks thank please yes no okay ok right left new old first second third " +
+    "fourth fifth final draft version total subtotal warning error info tip example output input result " +
+    "results monday tuesday wednesday thursday friday saturday sunday january february march april may " +
+    "june july august september october november december today tomorrow yesterday morning afternoon " +
+    "evening night week month year quarter " +
+    "the and or but for with from into onto about above below under over after before during " +
+    "i we he she they it this that these those there here what when where why how who whom whose " +
+    "hi hello hey goodbye bye so well now then just really actually basically maybe " +
+    "mr mrs ms miss mx dr prof professor rev sir dame " +
+    "q a re cc bcc to from"
+  ).split(/\s+/));
+
+  // Given names that are also ordinary words -- never propagate these on their own.
+  const AMBIGUOUS = new Set((
+    "will bill mark grace may june july art rose hope faith dawn summer autumn angel chance guy drew " +
+    "frank rich jack don pat sue max ray bud chip sunny joy earl duke king miles brook wade cliff dale " +
+    "glen heath rock stone reed read bird fox wolf field long short small best rich poor love young " +
+    "green white black brown gray grey price bell cook hill wood moore rivers brooks bond case " +
+    "victor major minor mason train sterling hunter carter parker taylor tanner"
+  ).split(/\s+/));
+
+  const ORG_SUFFIX = "Inc|Incorporated|LLC|Ltd|Limited|LLP|PLC|Corp|Corporation|Company|Co|Holdings|" +
+    "Group|Partners|Partnership|Associates|Ventures|Capital|Labs|Laboratories|Technologies|Solutions|" +
+    "Systems|Industries|Enterprises|Consulting|Consultants|Advisors|Advisory|Foundation|Institute|" +
+    "GmbH|AG|SARL|BV|NV|Pty|Oy|AB|SpA|Srl";
+
+  function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+  function cleanCandidate(s) {
+    return (s || "").replace(/\s+/g, " ").replace(/^[\s,;:.]+|[\s,;:.]+$/g, "").trim();
+  }
+
+  function isNameLike(name) {
+    const parts = name.split(" ");
+    if (!parts.length || parts.length > 4) return false;
+    if (NON_NAME_WORDS.has(parts[0].toLowerCase().replace(/\./g, ""))) return false;
+    if (parts.every((p) => NON_NAME_WORDS.has(p.toLowerCase().replace(/\./g, "")))) return false;
+    return parts.every((p) => new RegExp("^" + NPART + "$").test(p) && p.length > 1);
+  }
+
+  // Returns { personMap, orgMap } : lowercase term -> canonical identity string
+  function discoverNames(text, aggressive) {
+    const people = new Map();  // canonical lower -> display
+    const orgs = new Map();
+
+    const addPerson = (raw) => {
+      const n = cleanCandidate(raw);
+      if (n && isNameLike(n)) people.set(n.toLowerCase(), n);
+    };
+    const addOrg = (raw) => {
+      const n = cleanCandidate(raw);
+      if (n) orgs.set(n.toLowerCase(), n);
+    };
+
+    let m;
+
+    // 1. Transcript speaker labels:  "Sarah Chen:"   ">> Sarah Chen:"   "Sarah Chen (00:14):"
+    const speaker = new RegExp(
+      "^[ \\t]*(?:[>\\-*\\u2022]+[ \\t]*)?(" + NPART + "(?:[ \\t]+" + NPART + "){0,3})" +
+      "[ \\t]*(?:\\([^)\\n]{0,40}\\))?[ \\t]*(?:\\[[^\\]\\n]{0,40}\\])?[ \\t]*:", "gm");
+    while ((m = speaker.exec(text)) !== null) addPerson(m[1]);
+
+    // 2. WebVTT voice spans: <v Sarah Chen>
+    const vtt = /<v\s+([^>\n]{1,60})>/gi;
+    while ((m = vtt.exec(text)) !== null) addPerson(m[1]);
+
+    // 3. Honorifics and titles
+    const honorific = new RegExp(
+      "\\b(?:Mr|Mrs|Ms|Miss|Mx|Dr|Prof|Professor|Rev|Fr|Sir|Dame|Sgt|Capt|Lt|Col|Gen|Judge|Justice|" +
+      "Sen|Rep|Gov|President|Chairman|Chairwoman|CEO|CFO|CTO|COO|VP)\\.?\\s+(" +
+      NPART + "(?:\\s+" + NPART + "){0,2})", "g");
+    while ((m = honorific.exec(text)) !== null) addPerson(m[1]);
+
+    // 4. Known given name followed by a capitalised surname (optionally a middle initial)
+    const fullname = new RegExp("\\b(" + NPART + ")\\s+((?:[A-Z]\\.\\s+)?" + NPART + ")\\b", "g");
+    while ((m = fullname.exec(text)) !== null) {
+      if (FIRST_NAMES.has(m[1].toLowerCase().replace(/\./g, ""))) addPerson(m[1] + " " + m[2]);
+    }
+
+    // 5. Bare known given names ("Thanks, Priya.") -- skipping word-like ones
+    const bare = new RegExp("\\b(" + NPART + ")\\b", "g");
+    while ((m = bare.exec(text)) !== null) {
+      const lw = m[1].toLowerCase().replace(/\./g, "");
+      if (FIRST_NAMES.has(lw) && !AMBIGUOUS.has(lw) && !NON_NAME_WORDS.has(lw)) addPerson(m[1]);
+    }
+
+    // 6. Aggressive: any capitalised multi-word phrase (opt-in; noisy by design)
+    if (aggressive) {
+      const cap = new RegExp("\\b(" + NPART + "(?:\\s+" + NPART + "){1,3})\\b", "g");
+      while ((m = cap.exec(text)) !== null) addPerson(m[1]);
+    }
+
+    // 7. Organisations: 1-4 capitalised words ending in a corporate suffix
+    const orgRe = new RegExp(
+      "\\b((?:" + NPART + "[ \\t]+){0,3}" + NPART + ",?[ \\t]+(?:" + ORG_SUFFIX + ")\\.?)(?![A-Za-z])", "g");
+    while ((m = orgRe.exec(text)) !== null) addOrg(m[1]);
+
+    // ---- propagate: map every usable variant back to one canonical identity ----
+    const personMap = new Map();
+    // Longest names first, so "Sarah Chen" claims the identity before a bare "Sarah" can.
+    const peopleByLen = Array.from(people.entries())
+      .sort((a, b) => b[1].split(" ").length - a[1].split(" ").length || b[0].length - a[0].length);
+    for (const [canon, display] of peopleByLen) {
+      if (!personMap.has(canon)) personMap.set(canon, canon);
+      const parts = display.split(" ");
+      if (parts.length > 1) {
+        for (const p of parts) {
+          const lp = p.toLowerCase().replace(/\./g, "");
+          if (lp.length < 3) continue;
+          if (NON_NAME_WORDS.has(lp) || AMBIGUOUS.has(lp)) continue;
+          if (!personMap.has(lp)) personMap.set(lp, personMap.get(canon) || canon);
+        }
+      }
+    }
+
+    const orgMap = new Map();
+    const orgsByLen = Array.from(orgs.entries()).sort((a, b) => b[0].length - a[0].length);
+    for (const [canon, display] of orgsByLen) {
+      if (!orgMap.has(canon)) orgMap.set(canon, canon);
+      // bare core without the legal suffix: "Northwind Logistics, Inc." -> "Northwind Logistics"
+      const core = cleanCandidate(display.replace(
+        new RegExp(",?[ \\t]+(?:" + ORG_SUFFIX + ")\\.?$"), ""));
+      const lc = core.toLowerCase();
+      if (core && core.length >= 4 && !NON_NAME_WORDS.has(lc) && !orgMap.has(lc)) orgMap.set(lc, canon);
+      // and the distinctive leading word: "Northwind Logistics" -> "Northwind"
+      const head = core.split(" ")[0] || "";
+      const lh = head.toLowerCase().replace(/[.,]/g, "");
+      if (head.length >= 4 && !NON_NAME_WORDS.has(lh) && !AMBIGUOUS.has(lh) && !orgMap.has(lh)) {
+        orgMap.set(lh, canon);
+      }
+    }
+
+    return { personMap, orgMap };
+  }
+
+  // Add every occurrence of each discovered term as a match, in ONE pass over the text.
+  function addTermMatches(text, matches, termMap, detectorId, priority) {
+    const terms = Array.from(termMap.keys()).filter(Boolean);
+    if (!terms.length) return;
+    terms.sort((a, b) => b.length - a.length); // longest wins: "Sarah Chen" before "Sarah"
+    const re = new RegExp(
+      "(?<![" + WORDCH + "])(?:" + terms.map(escapeRe).join("|") + ")(?![" + WORDCH + "])", "gi");
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      matches.push({
+        start: m.index, end: m.index + m[0].length, detectorId, value: m[0],
+        canonical: termMap.get(m[0].toLowerCase()) || m[0].toLowerCase(), priority,
+      });
+      if (m.index === re.lastIndex) re.lastIndex++;
+    }
+  }
+
   // ---------- DOM ----------
   const $ = (id) => document.getElementById(id);
   const inputEl = $("input"), outputEl = $("output");
@@ -244,6 +447,7 @@
     wrap.className = "check";
     const cb = document.createElement("input");
     cb.type = "checkbox"; cb.checked = d.on; cb.dataset.id = d.id;
+    if (d.title) wrap.title = d.title;
     cb.addEventListener("change", () => { settings[d.id] = cb.checked; });
     const span = document.createElement("span");
     span.textContent = d.label;
@@ -256,7 +460,7 @@
     // Collect all matches from all enabled detectors, then resolve overlaps by priority (order in DETECTORS).
     const matches = []; // {start, end, detectorId, value, priority}
     DETECTORS.forEach((d, priority) => {
-      if (!settings[d.id]) return;
+      if (!settings[d.id] || !d.re) return;
       d.re.lastIndex = 0;
       let m;
       while ((m = d.re.exec(text)) !== null) {
@@ -272,6 +476,17 @@
         if (m.index === d.re.lastIndex) d.re.lastIndex++; // safety
       }
     });
+
+    // Names & organisations: discover once via anchors, then propagate every mention.
+    if (settings.person || settings.org || settings.person_aggressive) {
+      const pPri = DETECTORS.findIndex((x) => x.id === "person");
+      const oPri = DETECTORS.findIndex((x) => x.id === "org");
+      const found = discoverNames(text, !!settings.person_aggressive);
+      if (settings.person || settings.person_aggressive) {
+        addTermMatches(text, matches, found.personMap, "person", pPri);
+      }
+      if (settings.org) addTermMatches(text, matches, found.orgMap, "org", oPri);
+    }
 
     // Custom terms as whole-word case-insensitive matches
     const customList = customTerms
@@ -302,7 +517,7 @@
     const counters = {};
     const idMap = new Map(); // value+detector -> N (so identical values share the same number)
     for (const m of kept) {
-      const key = m.detectorId + " " + m.value.toLowerCase();
+      const key = m.detectorId + "\u0000" + (m.canonical || m.value.toLowerCase());
       if (!idMap.has(key)) {
         counters[m.detectorId] = (counters[m.detectorId] || 0) + 1;
         idMap.set(key, counters[m.detectorId]);
